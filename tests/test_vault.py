@@ -71,6 +71,37 @@ class TestGetAllMappings:
         assert found[surrogate] == "10.10.50.5"
 
 
+class TestEncryption:
+    def test_original_not_stored_in_cleartext(self, vault):
+        import sqlite3
+        secret = "Sup3rSecret-Passw0rd!"
+        _store(secret, "CREDENTIAL", vault)
+
+        conn = sqlite3.connect(str(vault))
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(pii_vault)")]
+        assert "original" not in cols          # no cleartext column
+        assert "original_enc" in cols
+
+        blob = " ".join(
+            str(r[0]) for r in conn.execute("SELECT original_enc FROM pii_vault")
+        )
+        assert secret not in blob              # ciphertext must not leak the value
+
+    def test_roundtrip_decrypts(self, vault):
+        s = _store("10.10.50.5", "IP_ADDRESS", vault)
+        mappings = get_all_mappings(engagement="test", db_path=vault)
+        assert (s, "10.10.50.5") in mappings
+
+    def test_wrong_key_is_rejected(self, vault, monkeypatch):
+        from src import crypto
+        _store("10.10.50.5", "IP_ADDRESS", vault)   # creates salt + canary with test key
+        crypto._cache.clear()
+        monkeypatch.setenv("VAULT_KEY", "a-completely-different-passphrase")
+        with pytest.raises(crypto.VaultKeyError):
+            get_all_mappings(engagement="test", db_path=vault)
+        crypto._cache.clear()
+
+
 class TestGetStats:
     def test_counts_by_type(self, vault):
         from unittest.mock import patch

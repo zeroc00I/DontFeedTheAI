@@ -28,7 +28,10 @@ class Config:
 
     # Proxy
     PORT: int = int(os.getenv("PORT", "8080"))
-    HOST: str = os.getenv("HOST", "0.0.0.0")
+    # Local-only by default: bind to loopback so the proxy is never reachable
+    # from the LAN. In Docker the container still binds 0.0.0.0 internally, but
+    # the compose port mapping publishes it only on 127.0.0.1 (see docker-compose.yml).
+    HOST: str = os.getenv("HOST", "127.0.0.1")
     # Optional shared secret — if set, all requests must include it as a URL path prefix:
     #   ANTHROPIC_BASE_URL=http://localhost:8080/<PROXY_SECRET>
     # Requests without the prefix are rejected with 403. /health is always open.

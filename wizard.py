@@ -9,7 +9,6 @@ Usage:
     python3 wizard.py sync         # sync code + rebuild proxy container
     python3 wizard.py connect      # open tunnel + launch Claude
     python3 wizard.py tunnel       # open tunnel only (no Claude)
-    python3 wizard.py tunnel --audit  # tunnel + open audit UI in browser
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ import sys
 import tempfile
 import time
 import urllib.request
-import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -913,13 +911,6 @@ def do_connect(cfg: dict) -> None:
     launch_dir  = pentest_dir or str(Path.home() / "pentests" / engagement_id)
     Path(launch_dir).mkdir(parents=True, exist_ok=True)
 
-    # Open audit UI in browser
-    audit_url = f"http://localhost:{proxy_port}/audit"
-    try:
-        webbrowser.open(audit_url)
-    except Exception:
-        pass
-
     # Session summary
     print()
     print(HR)
@@ -927,7 +918,6 @@ def do_connect(cfg: dict) -> None:
     print(HR)
     print(f"  Engagement  : {engagement_id}")
     print(f"  Proxy       : {base_url}")
-    print(f"  Audit UI    : {audit_url}")
     print(f"  Working dir : {C}{launch_dir}{N}")
     print(HR)
     print()
@@ -979,7 +969,7 @@ def do_connect(cfg: dict) -> None:
 
 # ── Tunnel only ───────────────────────────────────────────────────────────────
 
-def do_tunnel(cfg: dict, open_audit: bool = False) -> None:
+def do_tunnel(cfg: dict) -> None:
     proxy_port = int(cfg.get("proxy_port", "5555"))
 
     header("Tunnel — SSH only")
@@ -1006,16 +996,8 @@ def do_tunnel(cfg: dict, open_audit: bool = False) -> None:
         err("Proxy didn't respond. Is the VPS stack running?")
         sys.exit(1)
 
-    audit_url = f"http://localhost:{proxy_port}/audit"
     ok(f"Tunnel ready — localhost:{proxy_port}")
-    info(f"Audit UI : {audit_url}")
     info("Press Ctrl+C to close tunnel.")
-
-    if open_audit:
-        try:
-            webbrowser.open(audit_url)
-        except Exception:
-            pass
 
     try:
         tunnel_proc.wait()
@@ -1203,7 +1185,6 @@ def _print_help() -> None:
     print(f"  {B}python3 wizard.py deploy{N}              full deploy to VPS")
     print(f"  {B}python3 wizard.py sync{N}                push code updates to VPS")
     print(f"  {B}python3 wizard.py tunnel{N}              SSH tunnel only")
-    print(f"  {B}python3 wizard.py tunnel --audit{N}      tunnel + open audit UI in browser")
     print(f"  {B}python3 wizard.py install{N}             install 'dfai' global command")
     print(f"  {B}python3 wizard.py setup{N}               create venv + install dependencies")
     print(f"  {B}python3 wizard.py test{N}                run tests")
@@ -1249,7 +1230,7 @@ def main() -> None:
         do_connect(_require_env("connect"))
 
     elif cmd == "tunnel":
-        do_tunnel(_require_env("tunnel"), open_audit="--audit" in args)
+        do_tunnel(_require_env("tunnel"))
 
     elif cmd == "install":
         do_install()
@@ -1281,7 +1262,7 @@ def main() -> None:
 
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: python3 wizard.py [setup | deploy | sync | connect | tunnel [--audit]")
+        print("Usage: python3 wizard.py [setup | deploy | sync | connect | tunnel")
         print("                          install | test [--integration] | improve [--cycles N]")
         print("                          benchmark | docker <up|down> | vault <stats|clear> | clean]")
         sys.exit(1)

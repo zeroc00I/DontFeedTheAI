@@ -2,7 +2,7 @@
 # All logic lives in wizard.py. These are Unix convenience aliases only.
 # Windows users: run python3 wizard.py <command> directly.
 
-.PHONY: setup wizard deploy sync connect tunnel audit test improve benchmark \
+.PHONY: setup wizard deploy sync connect tunnel test improve benchmark \
         docker-up docker-down vault-stats vault-clear clean install
 
 setup:
@@ -22,9 +22,6 @@ connect:
 
 tunnel:
 	python3 wizard.py tunnel
-
-audit:
-	python3 wizard.py tunnel --audit
 
 install:
 	python3 wizard.py install

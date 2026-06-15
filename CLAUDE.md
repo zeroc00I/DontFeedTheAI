@@ -17,7 +17,7 @@ The single entry point for everything is `wizard.py`. No shell scripts. Cross-pl
 | `python3 wizard.py deploy` | Rsync + Docker install + UFW + start containers + health check |
 | `python3 wizard.py sync` | Push code changes to VPS + rebuild proxy container |
 | `python3 wizard.py connect` | Open SSH tunnel + wait for proxy + launch Claude with env vars set |
-| `python3 wizard.py tunnel [--audit]` | SSH tunnel only (no Claude); `--audit` opens browser |
+| `python3 wizard.py tunnel` | SSH tunnel only (no Claude) |
 | `python3 wizard.py install` | Install `dfai` global command in /usr/local/bin |
 | `python3 wizard.py test [--integration]` | Run pytest |
 | `python3 wizard.py improve [--cycles N]` | Auto-improvement loop (regex-only, no Ollama needed) |
@@ -36,7 +36,9 @@ The Makefile is a thin alias layer — all logic is in wizard.py.
 | `src/anonymizer.py` | Orchestrates LLM + regex detection, vault replacement |
 | `src/regex_detector.py` | Safety-net: structured patterns (IPs, hashes, tokens, paths…) |
 | `src/llm_detector.py` | Contextual detection via Ollama (hostnames, org names, people) |
-| `src/vault.py` | Per-engagement SQLite surrogate store |
+| `src/vault.py` | Per-engagement SQLite surrogate store (encrypted at rest — see `src/crypto.py`) |
+| `src/crypto.py` | Fernet encryption + HMAC blind index for the vault; fail-closed on missing/wrong VAULT_KEY |
+| `src/netguard.py` | Outbound allowlist — restricts the proxy to the configured LLM upstreams |
 | `src/surrogates.py` | Generates realistic fake replacements by entity type |
 | `data/system_prompt.txt` | LLM detector system prompt — lists what to flag / not flag |
 | `tests/fixtures.py` | Ground-truth test cases: `must_anonymize` + `safe_to_keep` |

@@ -18,6 +18,9 @@ os.environ.setdefault("DATA_DIR", _tmp)
 os.environ.setdefault("DATABASE_PATH", str(Path(_tmp) / "test_vault.db"))
 os.environ.setdefault("ENGAGEMENT_ID", "test-engagement")
 os.environ.setdefault("LLM_ENABLED", "true")
+# The vault is encrypted and fail-closed: a key must be present or the proxy
+# refuses to start. Use a throwaway passphrase for the test suite.
+os.environ.setdefault("VAULT_KEY", "test-vault-passphrase-not-for-real-use")
 
 
 @pytest.fixture(autouse=True)

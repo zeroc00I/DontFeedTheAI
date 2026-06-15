@@ -5,9 +5,11 @@
 services:
   proxy:
     build: .
+    # Loopback-only. Export VAULT_KEY in your shell before bringing the stack up.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
+      VAULT_KEY: ${VAULT_KEY:?VAULT_KEY must be exported (the vault is encrypted; do not store it in .env)}
       # host.docker.internal resolves to the Mac host from inside Docker
       OLLAMA_HOST: http://host.docker.internal:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
