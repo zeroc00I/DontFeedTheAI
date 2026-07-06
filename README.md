@@ -72,7 +72,7 @@ flowchart LR
 ```
 
 **✅ DontFeedTheAI** — cloud reasoning quality, local detection, nothing sensitive crosses the boundary.
-Works with Claude Code, OpenAI SDK, OpenRouter, or any OpenAI-compatible client.
+Works with Claude Code, OpenAI SDK, OpenRouter, Requesty, or any OpenAI-compatible client.
 
 ```mermaid
 flowchart LR

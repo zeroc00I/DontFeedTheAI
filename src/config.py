@@ -7,7 +7,7 @@ BASE_DIR = Path(__file__).parent.parent
 class Config:
     # Upstream LLM APIs (path-routed by the proxy)
     ANTHROPIC_API_URL: str = os.getenv("ANTHROPIC_API_URL", "https://api.anthropic.com")
-    # OpenAI-compatible: OpenAI, OpenRouter, local gateways, etc.
+    # OpenAI-compatible: OpenAI, OpenRouter, Requesty, local gateways, etc.
     OPENAI_API_URL: str = os.getenv("OPENAI_API_URL", "https://api.openai.com")
 
     # Ollama — local LLM for contextual PII detection
