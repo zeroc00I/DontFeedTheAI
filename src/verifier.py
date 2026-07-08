@@ -22,6 +22,7 @@ from pathlib import Path
 import httpx
 
 from .config import config
+from . import crypto
 
 log = logging.getLogger("cc-proxy.verifier")
 
@@ -42,12 +43,12 @@ def _init_db():
     with _get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS traffic (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                engagement  TEXT    NOT NULL,
-                recorded_at REAL    NOT NULL,
-                original    TEXT    NOT NULL,
-                anonymized  TEXT    NOT NULL,
-                verified    INTEGER NOT NULL DEFAULT 0
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                engagement    TEXT    NOT NULL,
+                recorded_at   REAL    NOT NULL,
+                original_enc  TEXT    NOT NULL,   -- Fernet-encrypted real text
+                anonymized    TEXT    NOT NULL,   -- surrogate-only, safe in cleartext
+                verified      INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS failures (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,9 +83,10 @@ def record_traffic(original: str, anonymized: str) -> None:
     try:
         _init_db()
         with _get_conn() as conn:
+            original_enc = crypto.cipher_for(conn).encrypt(original)
             conn.execute(
-                "INSERT INTO traffic (engagement, recorded_at, original, anonymized) VALUES (?,?,?,?)",
-                (config.ENGAGEMENT_ID, time.time(), original, anonymized),
+                "INSERT INTO traffic (engagement, recorded_at, original_enc, anonymized) VALUES (?,?,?,?)",
+                (config.ENGAGEMENT_ID, time.time(), original_enc, anonymized),
             )
     except Exception as exc:
         log.debug(f"record_traffic failed: {exc}")
@@ -229,13 +231,23 @@ def get_pending_failures(limit: int = 50) -> list[dict]:
     try:
         _init_db()
         conn = _get_conn()
+        cipher = crypto.cipher_for(conn)
         rows = conn.execute(
-            "SELECT f.id, f.leaked_text, f.concern, t.original, t.anonymized "
+            "SELECT f.id, f.leaked_text, f.concern, t.original_enc, t.anonymized "
             "FROM failures f JOIN traffic t ON f.traffic_id = t.id "
             "WHERE f.used_for_improvement=0 ORDER BY f.found_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            enc = d.pop("original_enc", "")
+            try:
+                d["original"] = cipher.decrypt(enc) if enc else ""
+            except Exception:
+                d["original"] = ""
+            out.append(d)
+        return out
     except Exception as exc:
         log.debug(f"get_pending_failures failed: {exc}")
         return []

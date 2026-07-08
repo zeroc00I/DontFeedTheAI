@@ -24,6 +24,7 @@ services:
     ports:
       - "127.0.0.1:${PROXY_PORT:-5555}:5555"   # bind to loopback only — expose via SSH tunnel
     environment:
+      VAULT_KEY: ${VAULT_KEY:?VAULT_KEY must be exported (the vault is encrypted; do not store it in .env)}
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
       OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-90}
@@ -89,6 +90,7 @@ services:
           --idle-minutes 30 --rounds 2 \
           --proxy-url http://proxy:5555
     environment:
+      VAULT_KEY: ${VAULT_KEY:?VAULT_KEY must be exported (the vault is encrypted; do not store it in .env)}
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
       OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-90}

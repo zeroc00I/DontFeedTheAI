@@ -13,20 +13,32 @@ A **risk-reduction layer**, not a privacy guarantee.
 
 - Correlation via query patterns
 - Prompt injection embedded in tool output *(e.g. a target server returning `Ignore previous instructions...` in a banner)*
-- Compromise of the proxy process itself
-- **Access to `/audit` by an attacker who reaches the proxy host** — see below
+- Compromise of the proxy process *while it is running* — an attacker with the
+  live process and the VAULT_KEY in memory can still deanonymize
 
-## The `/audit` page
+## Local-hardening posture (this fork)
 
-`/audit` is a **debug tool**, not an operational interface.
+This fork is built to run **purely locally**. The reverse-lookup table is never
+exposed and the data at rest is encrypted:
 
-It shows the full transformation log: every `ORIGINAL → SURROGATE` mapping stored in the vault for the current engagement. This makes it easy to verify that anonymization worked correctly and to diagnose leaks during development.
-
-The security implication is significant: **whoever can reach `/audit` can reverse the entire anonymization**. A single endpoint hands an attacker a complete lookup table for the session.
-
-This is an accepted trade-off for now, because the proxy is designed to run locally or on a VPS reachable only via SSH tunnel. The tunnel is the access control.
-
-**On the roadmap:** make the vault write-only from the outside. The audit log will remain available to the operator in-session, but the surrogate → original lookup will not be exposed over HTTP. An attacker who compromises the proxy host should not be able to undo all engagements from one URL.
+- **No `/audit` endpoint.** The HTTP surface that previously dumped the full
+  `surrogate → original` table has been removed entirely. There is no way to read
+  the mapping over HTTP.
+- **Encrypted vault.** Real `original` values are encrypted at rest (Fernet /
+  AES-128 + HMAC) with a key derived from the `VAULT_KEY` passphrase. The
+  passphrase is never stored on disk; only a non-secret salt and an encrypted
+  canary live in the database. Lose the key → the vault is unreadable. The
+  background verifier's `verify.db` is encrypted the same way.
+- **Fail-closed key handling.** Without a valid `VAULT_KEY` the proxy refuses to
+  start, and a wrong passphrase aborts on a canary check instead of silently
+  corrupting the surrogate space.
+- **Loopback bind.** The proxy and Ollama bind to `127.0.0.1` only (Docker
+  publishes the port on loopback), so neither is reachable from the LAN.
+- **Outbound allowlist.** The proxy only connects to the configured LLM
+  upstreams and your local Ollama; any other destination is blocked, so the data
+  it holds cannot be exfiltrated to an unexpected host.
+- **Only surrogates cross the boundary.** Real values are restored locally before
+  the response reaches Claude Code; the cloud LLM only ever sees masked text.
 
 ## On trusting a local LLM as a security layer
 
@@ -47,9 +59,10 @@ Coverage is not a claim — it is a test result any contributor can reproduce.
 
 ## Roadmap
 
-- [ ] **Write-only vault** — `/audit` shows what was anonymized but the reverse lookup (surrogate → original) is never exposed over HTTP; operators export the mapping offline at session close
+- [x] **No HTTP reverse lookup** — the `/audit` endpoint was removed; the
+      surrogate → original table is never exposed over HTTP
+- [x] **Encrypted vault** — original values encrypted at rest with VAULT_KEY
 - [ ] Ephemeral vault — in-memory only, zero persistence after session
 - [ ] Prompt injection detection — scan tool output before forwarding
 - [ ] Streaming deanonymization — currently buffers full response
-- [ ] Audit log export — JSONL of every entity detected per engagement
 - [ ] Coverage dashboard — per-fixture catch rates over time

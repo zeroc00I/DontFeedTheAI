@@ -14,6 +14,12 @@
 
 A transparent proxy that strips IPs, credentials, hostnames, and PII from every request before it reaches the AI — and restores them on the way back.
 
+> **Local-hardened fork.** This fork runs purely locally: the vault is **encrypted
+> at rest** (`VAULT_KEY`, fail-closed), the HTTP **audit/reverse-lookup endpoint is
+> removed**, the proxy binds to **loopback only**, and outbound traffic is
+> restricted to an **allowlist** of the configured LLM upstreams. Only masked
+> surrogates ever leave the machine.
+
 ```mermaid
 flowchart TD
     shell["🖥️ Your Shell\nnmap -sV dc01.acmecorp.local"]
@@ -102,11 +108,17 @@ The wizard asks everything — engagement name, VPS address, model — then depl
 
 ```bash
 python3 wizard.py setup       # create venv + install dependencies
-python3 wizard.py docker up   # start proxy + Ollama in Docker
+export VAULT_KEY="$(openssl rand -hex 32)"   # required — encrypts the vault (keep it safe)
+python3 wizard.py docker up   # start proxy + Ollama in Docker (loopback only)
 export ANTHROPIC_BASE_URL=http://localhost:8080
 export ENGAGEMENT_ID=my-engagement
 claude                        # or any OpenAI-compatible client
 ```
+
+`VAULT_KEY` is **required**: the surrogate→original vault is encrypted at rest and
+the proxy will not start without it. Export it in your shell (do not put it in
+`.env`) so the passphrase never lands on disk. If you lose it, the vault cannot
+be decrypted.
 
 Works on Windows, macOS, and Linux.
 
@@ -131,17 +143,10 @@ python3 wizard.py --help   # all available commands
 
 Two tools ship with DontFeedTheAI to help you validate coverage and extend it.
 
-**Visual audit** — open in browser while the proxy is running:
-
-```bash
-python3 wizard.py tunnel --audit
-```
-
-Shows every `ORIGINAL → SURROGATE` mapping logged during the session, filterable by entity type (DOMAIN, CREDENTIAL, TOKEN, HASH…) with per-request timing breakdown. Use it to spot leaks at a glance instead of grepping logs.
-
-![audit dashboard](docs/audit-screenshot.png)
-
-> The audit page is a **debug tool**. It exposes the full surrogate → original lookup table, which is why it only runs behind the SSH tunnel. Making this write-only (no reverse lookup over HTTP) is on the roadmap — see [Threat Model](docs/threat-model.md).
+> **Note (local-hardening fork):** the in-browser audit dashboard has been
+> **removed** — it exposed the full `surrogate → original` lookup table over HTTP.
+> The vault is encrypted at rest and the mapping is never served over the network.
+> Use the loops below to validate coverage instead.
 
 **Testing the full pipeline** — requires Ollama running:
 

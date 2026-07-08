@@ -1,9 +1,18 @@
 """
-SQLite-backed PII vault.
+SQLite-backed PII vault — encrypted at rest.
 
 Every original→surrogate mapping is stored here, keyed by engagement ID.
 The same original value within an engagement always maps to the same surrogate.
 Different engagements are fully isolated — same IP at two clients gets different surrogates.
+
+Security model (local-only tool):
+  • The real `original` value is stored ENCRYPTED (`original_enc`, Fernet).
+  • Lookups use a keyed `original_hash` (HMAC blind index) so the same value can be
+    found for dedup WITHOUT keeping it in cleartext.
+  • The `surrogate` is fake by construction and stays in cleartext so reverse
+    lookups (deanonymization) are fast.
+  • The encryption key is derived from VAULT_KEY (see src/crypto.py); the proxy
+    refuses to start without it.
 """
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -12,6 +21,7 @@ from pathlib import Path
 _TZ_BRT = timezone(timedelta(hours=-3))
 
 from .config import config
+from . import crypto
 
 
 def _conn(db_path: Path | None = None) -> sqlite3.Connection:
@@ -26,34 +36,35 @@ def init_db(db_path: Path | None = None) -> None:
     conn = _conn(db_path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS pii_vault (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            engagement   TEXT    NOT NULL,
-            entity_type  TEXT    NOT NULL,
-            original     TEXT    NOT NULL,
-            surrogate    TEXT    NOT NULL,
-            created_at   TEXT    NOT NULL,
-            UNIQUE(engagement, original, entity_type)
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            engagement    TEXT    NOT NULL,
+            entity_type   TEXT    NOT NULL,
+            original_hash TEXT    NOT NULL,   -- keyed HMAC blind index (for dedup lookup)
+            original_enc  TEXT    NOT NULL,   -- Fernet-encrypted real value
+            surrogate     TEXT    NOT NULL,   -- fake value, safe in cleartext
+            created_at    TEXT    NOT NULL,
+            UNIQUE(engagement, original_hash, entity_type)
         );
         CREATE INDEX IF NOT EXISTS idx_surrogate
             ON pii_vault(engagement, surrogate);
-
-        -- Audit trail: every time a value is seen (new or cached) during a request
-        CREATE TABLE IF NOT EXISTS transform_log (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts           TEXT    NOT NULL,
-            engagement   TEXT    NOT NULL,
-            entity_type  TEXT    NOT NULL,
-            original     TEXT    NOT NULL,
-            surrogate    TEXT    NOT NULL,
-            is_new       INTEGER NOT NULL DEFAULT 0  -- 1 = new mapping, 0 = retrieved from cache
-        );
-        CREATE INDEX IF NOT EXISTS idx_log_ts
-            ON transform_log(ts DESC);
-        CREATE INDEX IF NOT EXISTS idx_log_eng
-            ON transform_log(engagement, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_orig_hash
+            ON pii_vault(engagement, original_hash, entity_type);
     """)
     conn.commit()
     conn.close()
+
+
+def assert_key_ok(db_path: Path | None = None) -> None:
+    """Open the vault and validate VAULT_KEY against the stored canary.
+
+    Called once at startup so a missing/wrong passphrase fails loudly and early
+    instead of corrupting the surrogate space. Raises crypto.VaultKeyError.
+    """
+    conn = _conn(db_path)
+    try:
+        crypto.cipher_for(conn)   # creates salt+canary on first run, verifies after
+    finally:
+        conn.close()
 
 
 def get_or_create(
@@ -67,80 +78,32 @@ def get_or_create(
 
     is_new=True  → first time this value is seen; a new mapping was created.
     is_new=False → value was already in the vault; existing surrogate returned.
-
-    Also appends a row to transform_log so the /audit page can show history.
     """
     eng = engagement or config.ENGAGEMENT_ID
     ts  = datetime.now(_TZ_BRT).isoformat(timespec="seconds")
     conn = _conn(db_path)
     try:
+        cipher = crypto.cipher_for(conn)
+        ohash = cipher.blind_index(eng, entity_type, original)
+
         row = conn.execute(
             "SELECT surrogate FROM pii_vault "
-            "WHERE engagement=? AND original=? AND entity_type=?",
-            (eng, original, entity_type),
+            "WHERE engagement=? AND original_hash=? AND entity_type=?",
+            (eng, ohash, entity_type),
         ).fetchone()
 
         if row:
-            surrogate = row[0]
-            is_new = False
-        else:
-            surrogate = surrogate_fn(original, entity_type)
-            conn.execute(
-                "INSERT INTO pii_vault "
-                "(engagement, entity_type, original, surrogate, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (eng, entity_type, original, surrogate, ts),
-            )
-            is_new = True
+            return row[0], False
 
-        # Always log to audit trail (new AND cached hits, so operators see traffic)
+        surrogate = surrogate_fn(original, entity_type)
         conn.execute(
-            "INSERT INTO transform_log "
-            "(ts, engagement, entity_type, original, surrogate, is_new) "
+            "INSERT INTO pii_vault "
+            "(engagement, entity_type, original_hash, original_enc, surrogate, created_at) "
             "VALUES (?,?,?,?,?,?)",
-            (ts, eng, entity_type, original, surrogate, int(is_new)),
+            (eng, entity_type, ohash, cipher.encrypt(original), surrogate, ts),
         )
         conn.commit()
-        return surrogate, is_new
-    finally:
-        conn.close()
-
-
-def get_transform_log(
-    engagement: str | None = None,
-    db_path: Path | None = None,
-    limit: int = 500,
-) -> list[dict]:
-    """Return recent transform_log entries newest-first."""
-    eng = engagement or config.ENGAGEMENT_ID
-    conn = _conn(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT ts, engagement, entity_type, original, surrogate, is_new "
-            "FROM transform_log "
-            "WHERE engagement=? "
-            "ORDER BY id DESC LIMIT ?",
-            (eng, limit),
-        ).fetchall()
-        return [
-            {
-                "ts": r[0], "engagement": r[1], "entity_type": r[2],
-                "original": r[3], "surrogate": r[4], "is_new": bool(r[5]),
-            }
-            for r in rows
-        ]
-    finally:
-        conn.close()
-
-
-def get_all_engagements(db_path: Path | None = None) -> list[str]:
-    """Return all distinct engagement IDs in the vault."""
-    conn = _conn(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT engagement FROM pii_vault ORDER BY engagement"
-        ).fetchall()
-        return [r[0] for r in rows]
+        return surrogate, True
     finally:
         conn.close()
 
@@ -149,15 +112,27 @@ def get_all_mappings(
     engagement: str | None = None,
     db_path: Path | None = None,
 ) -> list[tuple[str, str]]:
-    """Returns (surrogate, original) for the engagement, longest surrogate first."""
+    """Returns (surrogate, original) for the engagement, longest surrogate first.
+
+    Decrypts each original on read. Rows that fail to decrypt are skipped so a
+    single corrupt entry can never break deanonymization of the rest.
+    """
     eng = engagement or config.ENGAGEMENT_ID
     conn = _conn(db_path)
     try:
-        return conn.execute(
-            "SELECT surrogate, original FROM pii_vault "
+        cipher = crypto.cipher_for(conn)
+        rows = conn.execute(
+            "SELECT surrogate, original_enc FROM pii_vault "
             "WHERE engagement=? ORDER BY LENGTH(surrogate) DESC",
             (eng,),
         ).fetchall()
+        out: list[tuple[str, str]] = []
+        for surrogate, original_enc in rows:
+            try:
+                out.append((surrogate, cipher.decrypt(original_enc)))
+            except Exception:
+                continue
+        return out
     finally:
         conn.close()
 
