@@ -33,6 +33,12 @@ OpenRouter example:
 export OPENAI_API_URL=https://openrouter.ai/api   # server-side upstream target
 ```
 
+Requesty example (OpenAI-compatible router, https://requesty.ai):
+
+```bash
+export OPENAI_API_URL=https://router.requesty.ai   # server-side upstream target (proxy appends /v1/chat/completions)
+```
+
 Set `OPENAI_API_URL` in `.env` (or the process environment) on the **proxy host**, not in the client.
 
 ## GitHub Copilot and other providers
