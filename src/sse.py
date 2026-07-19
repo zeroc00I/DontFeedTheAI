@@ -13,7 +13,8 @@ stream*, without ever emitting a partial/undeanonymized surrogate:
   - every other event       → passed through untouched.
 
 The transform operates on parsed event dicts (the SSE `data` payloads) so it is
-independently testable; byte-level SSE parsing/encoding lives in main.py.
+independently testable. Byte-level reassembly (`iter_sse_data`) lives here and is
+shared with the OpenAI-compatible parser; main.py only glues the stream together.
 """
 from __future__ import annotations
 
@@ -61,7 +62,11 @@ async def iter_sse_data(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[str]
         buf += decoder.decode(chunk)
         for payload in _take_complete_lines():
             yield payload
+    # End of stream: flush the decoder and treat any residual (a final line the
+    # upstream sent without a trailing newline) as complete.
     buf += decoder.decode(b"", final=True)
+    if buf and not buf.endswith("\n"):
+        buf += "\n"
     for payload in _take_complete_lines():
         yield payload
     if data_lines:

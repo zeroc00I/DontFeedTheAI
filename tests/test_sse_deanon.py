@@ -116,6 +116,14 @@ async def test_iter_sse_events_handles_multibyte_utf8_split_across_chunks():
 
 
 @pytest.mark.asyncio
+async def test_iter_sse_events_emits_final_event_without_trailing_newline():
+    # Upstream closes right after the payload, no terminating blank line.
+    raw = 'data: {"type": "message_stop"}'
+    got = [e async for e in iter_sse_events(_byte_iter([raw]))]
+    assert got == [{"type": "message_stop"}]
+
+
+@pytest.mark.asyncio
 async def test_iter_sse_events_parses_multiple_events_in_one_chunk():
     raw = (
         'event: ping\ndata: {"type": "ping"}\n\n'
