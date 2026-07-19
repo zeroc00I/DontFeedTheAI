@@ -99,6 +99,23 @@ async def test_iter_sse_events_reassembles_across_chunk_boundaries():
 
 
 @pytest.mark.asyncio
+async def test_iter_sse_events_handles_multibyte_utf8_split_across_chunks():
+    # Web/search content is full of multi-byte UTF-8; httpx splits byte chunks at
+    # arbitrary boundaries, so a char can straddle two chunks. Must not garble.
+    payload = {"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": "Price €12, café, 日本, 😀 done"}}
+    raw = f"event: content_block_delta\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    async def _bytes():
+        for i in range(len(raw)):   # one byte at a time → splits every multi-byte char
+            yield raw[i : i + 1]
+
+    got = [e async for e in iter_sse_events(_bytes())]
+    assert got == [payload]
+    assert "�" not in got[0]["delta"]["text"]
+
+
+@pytest.mark.asyncio
 async def test_iter_sse_events_parses_multiple_events_in_one_chunk():
     raw = (
         'event: ping\ndata: {"type": "ping"}\n\n'

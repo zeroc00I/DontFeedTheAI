@@ -10,6 +10,7 @@ import json
 from typing import Any, AsyncIterable, AsyncIterator
 
 from ..anonymizer import StreamingDeanonymizer, _apply_mappings, anonymize, deanonymize, deanon_value
+from ..sse import iter_sse_data
 
 _DONE = "[DONE]"
 
@@ -102,40 +103,17 @@ def encode_openai_sse(obj: Any) -> str:
 async def iter_openai_sse(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[Any]:
     """Parse an OpenAI SSE byte stream into chunk dicts and the [DONE] sentinel.
 
-    Reassembles across arbitrary chunk boundaries. Non-JSON `data:` payloads
-    other than [DONE] are skipped.
+    Byte-level reassembly (incremental UTF-8 decode, multi-byte-safe) is shared
+    with the Anthropic parser. Non-JSON payloads other than [DONE] are skipped.
     """
-    buf = ""
-    data_lines: list[str] = []
-
-    def _emit(payload: str):
+    async for payload in iter_sse_data(aiter_bytes):
         if payload == _DONE:
-            return _DONE
+            yield _DONE
+            continue
         try:
-            return json.loads(payload)
+            yield json.loads(payload)
         except ValueError:
-            return None
-
-    async for chunk in aiter_bytes:
-        buf += chunk.decode("utf-8", errors="replace")
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            line = line.rstrip("\r")
-            if line == "":
-                if data_lines:
-                    got = _emit("\n".join(data_lines))
-                    data_lines = []
-                    if got is not None:
-                        yield got
-                continue
-            if line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-    if data_lines:
-        got = _emit("\n".join(data_lines))
-        if got is not None:
-            yield got
+            pass
 
 
 async def deanonymize_openai_stream(

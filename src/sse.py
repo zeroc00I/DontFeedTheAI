@@ -17,6 +17,7 @@ independently testable; byte-level SSE parsing/encoding lives in main.py.
 """
 from __future__ import annotations
 
+import codecs
 import json
 from typing import AsyncIterable, AsyncIterator
 
@@ -28,35 +29,54 @@ def encode_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-async def iter_sse_events(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[dict]:
-    """Parse a raw SSE byte stream into decoded `data:` JSON payloads.
+async def iter_sse_data(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[str]:
+    """Reassemble a raw SSE byte stream into `data:` payload strings.
 
-    Reassembles events across arbitrary chunk boundaries. `event:`/`id:`/comment
-    lines are ignored — the payload's own `type` field carries the event kind.
+    Uses an incremental UTF-8 decoder so a multi-byte character split across two
+    byte chunks (which httpx does at arbitrary boundaries) is decoded intact
+    rather than replaced with U+FFFD. `event:`/`id:`/comment lines are dropped.
     """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buf = ""
     data_lines: list[str] = []
-    async for chunk in aiter_bytes:
-        buf += chunk.decode("utf-8", errors="replace")
+
+    def _take_complete_lines() -> list[str]:
+        nonlocal buf, data_lines
+        payloads: list[str] = []
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
             line = line.rstrip("\r")
             if line == "":
                 if data_lines:
-                    payload = "\n".join(data_lines)
+                    payloads.append("\n".join(data_lines))
                     data_lines = []
-                    try:
-                        yield json.loads(payload)
-                    except ValueError:
-                        pass
                 continue
             if line.startswith(":"):
                 continue
             if line.startswith("data:"):
                 data_lines.append(line[5:].lstrip())
+        return payloads
+
+    async for chunk in aiter_bytes:
+        buf += decoder.decode(chunk)
+        for payload in _take_complete_lines():
+            yield payload
+    buf += decoder.decode(b"", final=True)
+    for payload in _take_complete_lines():
+        yield payload
     if data_lines:
+        yield "\n".join(data_lines)
+
+
+async def iter_sse_events(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[dict]:
+    """Parse a raw SSE byte stream into decoded `data:` JSON payloads.
+
+    The payload's own `type` field carries the event kind. Non-JSON payloads are
+    skipped.
+    """
+    async for payload in iter_sse_data(aiter_bytes):
         try:
-            yield json.loads("\n".join(data_lines))
+            yield json.loads(payload)
         except ValueError:
             pass
 

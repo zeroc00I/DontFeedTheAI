@@ -125,6 +125,19 @@ class TestCodec:
         assert encode_openai_sse({"a": 1}) == 'data: {"a": 1}\n\n'
 
     @pytest.mark.asyncio
+    async def test_iter_handles_multibyte_utf8_split_across_chunks(self):
+        chunk = {"choices": [{"index": 0, "delta": {"content": "Price €12, café, 日本, 😀"}}]}
+        raw = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+        async def _bytes():
+            for i in range(len(raw)):   # one byte at a time
+                yield raw[i : i + 1]
+
+        got = [e async for e in iter_openai_sse(_bytes())]
+        assert got == [chunk, "[DONE]"]
+        assert "�" not in got[0]["choices"][0]["delta"]["content"]
+
+    @pytest.mark.asyncio
     async def test_iter_parses_chunks_and_done(self):
         raw = (
             'data: {"id": "c1", "choices": []}\n\n'
