@@ -427,16 +427,100 @@ def deanon_value(obj):
     return obj
 
 
+def _apply_mappings(text: str, mappings: list[tuple[str, str]]) -> str:
+    """Replace each surrogate with its original. `mappings` must be sorted with
+    the longest surrogate first so a short surrogate never matches inside a
+    longer one."""
+    for surrogate, original in mappings:
+        if surrogate in text:
+            text = text.replace(surrogate, original)
+    return text
+
+
 def deanonymize(text: str) -> str:
     """Replace all surrogates with their originals for the current engagement."""
     if not text:
         return text
-
     # get_all_mappings returns (surrogate, original) sorted by surrogate length desc
-    # — prevents shorter surrogates from partially matching inside longer ones
-    mappings = get_all_mappings()
-    result = text
-    for surrogate, original in mappings:
-        if surrogate in result:
-            result = result.replace(surrogate, original)
-    return result
+    return _apply_mappings(text, get_all_mappings())
+
+
+class StreamingDeanonymizer:
+    """
+    Boundary-safe incremental de-anonymization for streaming responses.
+
+    Claude's reply streams token-by-token; a surrogate (e.g. "SRV-1042") can be
+    split across two SSE deltas ("SRV-10" + "42"). Feeding deltas through this
+    transformer never emits a partial/undeanonymized surrogate, yet the
+    concatenation of all feed() outputs plus flush() equals a full-buffer
+    deanonymize() of the same text.
+
+    Invariant: once feed() emits a character it is final. This holds because we
+    hold back the last (max_surrogate_len - 1) characters of the resolved buffer
+    — the only region where an as-yet-incomplete surrogate could still be forming.
+    Any surrogate touching the emitted prefix is already fully present and
+    resolved. flush() releases the remainder at end of stream.
+
+    Construct with a snapshot of (surrogate, original) pairs sorted longest
+    surrogate first (as get_all_mappings returns) so no short surrogate matches
+    inside a longer one.
+    """
+
+    def __init__(self, mappings: list[tuple[str, str]]):
+        self._mappings = list(mappings)
+        self._surrogates = [s for s, _ in self._mappings]
+        self._maxlen = max((len(s) for s in self._surrogates), default=0)
+        self._raw = ""        # everything received this stream
+        self._emitted_raw = 0  # raw chars already emitted (as resolved output)
+
+    def _resolve(self, text: str) -> str:
+        return _apply_mappings(text, self._mappings)
+
+    def _safe_cut(self, raw: str) -> int:
+        """
+        Largest raw index up to which output is final.
+
+        Start one char short of the longest surrogate — that tail is where an
+        as-yet-incomplete surrogate could still be forming. Then pull the cut
+        left past any *complete* surrogate occurrence that straddles it, so the
+        settled region [emitted, cut) never splits a surrogate.
+        """
+        n = len(raw)
+        if self._maxlen <= 1:
+            return n
+        c = n - (self._maxlen - 1)
+        if c <= 0:
+            return 0
+        moved = True
+        while moved:
+            moved = False
+            for s in self._surrogates:
+                L = len(s)
+                pos = raw.find(s, max(0, c - L + 1), c + L - 1)
+                while pos != -1 and pos < c:
+                    if pos + L > c:            # occurrence straddles the cut
+                        c = pos
+                        moved = True
+                        break
+                    pos = raw.find(s, pos + 1, c + L - 1)
+                if moved:
+                    break
+        return c
+
+    def feed(self, delta: str) -> str:
+        """Consume one chunk; return the portion now safe to emit (may be '')."""
+        if not delta:
+            return ""
+        self._raw += delta
+        cut = self._safe_cut(self._raw)
+        if cut <= self._emitted_raw:
+            return ""
+        out = self._resolve(self._raw[self._emitted_raw:cut])
+        self._emitted_raw = cut
+        return out
+
+    def flush(self) -> str:
+        """Release any held-back remainder at end of stream."""
+        out = self._resolve(self._raw[self._emitted_raw:])
+        self._emitted_raw = len(self._raw)
+        return out

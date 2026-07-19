@@ -7,9 +7,12 @@ Covers OpenAI, OpenRouter, and other OpenAI-compatible gateways via OPENAI_API_U
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterable, AsyncIterator
 
-from ..anonymizer import anonymize, deanonymize, deanon_value
+from ..anonymizer import StreamingDeanonymizer, _apply_mappings, anonymize, deanonymize, deanon_value
+from ..sse import iter_sse_data
+
+_DONE = "[DONE]"
 
 
 async def _anon_content_parts(content: Any, *, is_tool_output: bool) -> Any:
@@ -88,47 +91,135 @@ def deanonymize_chat_response(data: dict) -> dict:
     return data
 
 
-async def emit_chat_completion_sse(data: dict) -> AsyncIterator[str]:
+# ── Real streaming de-anonymization ──────────────────────────────────────────
+
+def encode_openai_sse(obj: Any) -> str:
+    """Serialize one OpenAI SSE line. The [DONE] sentinel is passed as a string."""
+    if obj == _DONE:
+        return "data: [DONE]\n\n"
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+async def iter_openai_sse(aiter_bytes: AsyncIterable[bytes]) -> AsyncIterator[Any]:
+    """Parse an OpenAI SSE byte stream into chunk dicts and the [DONE] sentinel.
+
+    Byte-level reassembly (incremental UTF-8 decode, multi-byte-safe) is shared
+    with the Anthropic parser. Non-JSON payloads other than [DONE] are skipped.
     """
-    Re-emit a complete chat completion as OpenAI-style SSE chunks.
-    Upstream is called with stream=false so the full body can be deanonymized first.
+    async for payload in iter_sse_data(aiter_bytes):
+        if payload == _DONE:
+            yield _DONE
+            continue
+        try:
+            yield json.loads(payload)
+        except ValueError:
+            pass
+
+
+async def deanonymize_openai_stream(
+    events: AsyncIterable[Any],
+    mappings: list[tuple[str, str]],
+) -> AsyncIterator[Any]:
+    """De-anonymize an OpenAI chat-completion stream.
+
+    Text (choices[].delta.content) is de-anonymized boundary-safe as it streams;
+    tool-call arguments are buffered per (choice, tool) index and de-anonymized
+    whole, emitted just before the choice's finish chunk. The [DONE] sentinel and
+    all envelope fields pass through.
     """
-    completion_id = data.get("id", "chatcmpl-dontfeedtheai")
-    model = data.get("model", "")
-    choices = data.get("choices") or []
-    if not choices:
-        yield "data: [DONE]\n\n"
-        return
+    text: dict[int, StreamingDeanonymizer] = {}          # choice index -> deanon
+    tools: dict[int, dict[int, dict]] = {}               # choice -> tool idx -> slot
+    template: dict = {}
 
-    choice0 = choices[0]
-    message = choice0.get("message") or {}
-    finish_reason = choice0.get("finish_reason") or "stop"
-    content = message.get("content") or ""
+    def _mk(choices: list) -> dict:
+        out = {"choices": choices}
+        for k in ("id", "object", "model", "created", "system_fingerprint"):
+            if k in template:
+                out[k] = template[k]
+        return out
 
-    def _chunk(delta: dict, *, finish: str | None = None) -> str:
-        payload: dict[str, Any] = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": finish,
-                }
-            ],
-        }
-        return f"data: {json.dumps(payload)}\n\n"
+    def _flush_tools(ci: int) -> dict | None:
+        slots = tools.pop(ci, None)
+        if not slots:
+            return None
+        tcs = []
+        for ti in sorted(slots):
+            slot = slots[ti]
+            args = _apply_mappings(slot["buf"], mappings) if slot["buf"] else slot["buf"]
+            fn: dict = {}
+            if slot["name"] is not None:
+                fn["name"] = slot["name"]
+            fn["arguments"] = args
+            entry: dict = {"index": ti, "function": fn}
+            if slot["id"] is not None:
+                entry["id"] = slot["id"]
+            if slot["type"] is not None:
+                entry["type"] = slot["type"]
+            tcs.append(entry)
+        return {"index": ci, "delta": {"tool_calls": tcs}, "finish_reason": None}
 
-    yield _chunk({"role": "assistant"})
+    async for ev in events:
+        if ev == _DONE:
+            # Defensive: flush anything not already closed by a finish_reason.
+            for ci in list(text):
+                tail = text.pop(ci).flush()
+                if tail:
+                    yield _mk([{"index": ci, "delta": {"content": tail}, "finish_reason": None}])
+            for ci in list(tools):
+                tc_chunk = _flush_tools(ci)
+                if tc_chunk:
+                    yield _mk([tc_chunk])
+            yield _DONE
+            continue
 
-    chunk_size = 32
-    for i in range(0, len(content), chunk_size):
-        yield _chunk({"content": content[i : i + chunk_size]})
+        for k in ("id", "object", "model", "created", "system_fingerprint"):
+            if k in ev:
+                template[k] = ev[k]
 
-    tool_calls = message.get("tool_calls") or []
-    if tool_calls:
-        yield _chunk({"tool_calls": tool_calls})
+        for choice in ev.get("choices", []) or []:
+            ci = choice.get("index", 0)
+            delta = choice.get("delta", {}) or {}
+            finish = choice.get("finish_reason")
 
-    yield _chunk({}, finish=finish_reason)
-    yield "data: [DONE]\n\n"
+            out_delta: dict = {}
+            if "role" in delta:
+                out_delta["role"] = delta["role"]
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                sd = text.get(ci)
+                if sd is None:
+                    sd = text[ci] = StreamingDeanonymizer(mappings)
+                resolved = sd.feed(content)
+                if resolved:
+                    out_delta["content"] = resolved
+
+            for tc in delta.get("tool_calls") or []:
+                ti = tc.get("index", 0)
+                slot = tools.setdefault(ci, {}).setdefault(
+                    ti, {"id": None, "type": None, "name": None, "buf": ""}
+                )
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                if tc.get("type"):
+                    slot["type"] = tc["type"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if isinstance(fn.get("arguments"), str):
+                    slot["buf"] += fn["arguments"]
+
+            if finish is None:
+                if out_delta:
+                    yield _mk([{"index": ci, "delta": out_delta, "finish_reason": None}])
+            else:
+                # finishing: flush text tail, then tool calls, then the finish chunk
+                sd = text.pop(ci, None)
+                tail = sd.flush() if sd else ""
+                content_piece = out_delta.get("content", "") + tail
+                if content_piece:
+                    yield _mk([{"index": ci, "delta": {"content": content_piece}, "finish_reason": None}])
+                tc_chunk = _flush_tools(ci)
+                if tc_chunk:
+                    yield _mk([tc_chunk])
+                yield _mk([{"index": ci, "delta": {}, "finish_reason": finish}])
