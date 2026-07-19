@@ -25,11 +25,12 @@ from .anonymizer import anonymize, deanonymize, deanon_value
 from .config import config
 from . import llm_detector
 from .llm_detector import OllamaUnavailableError
-from .vault import get_all_engagements, get_stats, get_transform_log, init_db
+from .vault import get_all_engagements, get_all_mappings, get_stats, get_transform_log, init_db
 from .verifier import start_background_verifier
 from . import timing as _timing
 from .hardware import detect_hardware, suggest_model, format_banner
 from .providers import openai_compat
+from .sse import deanonymize_sse, encode_sse, iter_sse_events
 from .providers.routing import upstream_base_for_path
 
 _TZ_BRT = timezone(timedelta(hours=-3))
@@ -614,80 +615,6 @@ def _deanon_response(data: dict) -> dict:
     return data
 
 
-# ── SSE re-emission ───────────────────────────────────────────────────────────
-
-async def _emit_sse(data: dict):
-    """
-    Re-emit a complete Anthropic response as a proper SSE stream.
-    We buffer the full response to deanonymize it, then re-stream it to
-    preserve the typing effect Claude Code users expect.
-    """
-    msg_start = {
-        "type": "message_start",
-        "message": {
-            "id":           data.get("id", ""),
-            "type":         "message",
-            "role":         "assistant",
-            "content":      [],
-            "model":        data.get("model", ""),
-            "stop_reason":  None,
-            "stop_sequence": None,
-            "usage":        data.get("usage", {}),
-        },
-    }
-    yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
-    yield 'event: ping\ndata: {"type":"ping"}\n\n'
-
-    for i, block in enumerate(data.get("content", [])):
-        t = block.get("type")
-
-        if t == "text":
-            text = block.get("text", "")
-            yield (
-                f"event: content_block_start\n"
-                f"data: {json.dumps({'type':'content_block_start','index':i,'content_block':{'type':'text','text':''}})}\n\n"
-            )
-            chunk_size = 32
-            for j in range(0, len(text), chunk_size):
-                delta = {
-                    "type": "content_block_delta",
-                    "index": i,
-                    "delta": {"type": "text_delta", "text": text[j: j + chunk_size]},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
-
-        elif t == "tool_use":
-            yield (
-                f"event: content_block_start\n"
-                f"data: {json.dumps({'type':'content_block_start','index':i,'content_block':{'type':'tool_use','id':block.get('id',''),'name':block.get('name',''),'input':{}}})}\n\n"
-            )
-            input_str = json.dumps(block.get("input", {}))
-            chunk_size = 32
-            for j in range(0, len(input_str), chunk_size):
-                delta = {
-                    "type": "content_block_delta",
-                    "index": i,
-                    "delta": {"type": "input_json_delta", "partial_json": input_str[j: j + chunk_size]},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
-
-        yield (
-            f"event: content_block_stop\n"
-            f"data: {{\"type\":\"content_block_stop\",\"index\":{i}}}\n\n"
-        )
-
-    msg_delta = {
-        "type": "message_delta",
-        "delta": {
-            "stop_reason":   data.get("stop_reason", "end_turn"),
-            "stop_sequence": None,
-        },
-        "usage": data.get("usage", {}),
-    }
-    yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
-    yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/last-activity")
@@ -763,7 +690,51 @@ async def proxy_messages(request: Request) -> Response:
     # Snapshot LLM + regex breakdown accumulated inside anonymize()
     anon_snap = _timing.snapshot()
 
-    # Force non-streaming so we can deanonymize the complete response
+    # ── Streaming path: forward stream=True and de-anonymize the SSE inline ────
+    # Surrogates are resolved as tokens arrive (boundary-safe for text/thinking;
+    # tool_use inputs buffered per block). Real streaming restores time-to-first-
+    # token instead of buffering the whole completion before the user sees output.
+    if want_stream:
+        body["stream"] = True
+        mappings = get_all_mappings()   # snapshot the vault for the whole response
+        upstream = f"{config.ANTHROPIC_API_URL}/v1/messages"
+
+        async def _stream_deanonymized():
+            try:
+                async with httpx.AsyncClient(timeout=600) as client:
+                    async with client.stream(
+                        "POST", upstream, json=body, headers=headers,
+                    ) as resp:
+                        if resp.status_code != 200:
+                            err = (await resp.aread()).decode("utf-8", "replace")[:500]
+                            log.warning(f"← Anthropic {resp.status_code} (stream): {err[:200]}")
+                            yield encode_sse("error", {
+                                "type": "error",
+                                "error": {"type": "api_error", "message": err},
+                            })
+                            return
+                        events = iter_sse_events(resp.aiter_bytes())
+                        async for out_ev in deanonymize_sse(events, mappings):
+                            yield encode_sse(out_ev.get("type", ""), out_ev)
+            finally:
+                total_ms = (time.perf_counter() - req_start) * 1000
+                _timing.record({
+                    "ts":        datetime.now(_TZ_BRT).strftime("%H:%M:%S"),
+                    "model":     model,
+                    "total_ms":  round(total_ms, 1),
+                    "anon_ms":   round(anon_ms, 1),
+                    "llm_ms":    anon_snap["llm_ms"],
+                    "regex_ms":  anon_snap["regex_ms"],
+                    # de-anonymization is folded into the stream, so its cost is
+                    # not separable; attribute the post-anon time to the round-trip.
+                    "api_ms":    round(max(0.0, total_ms - anon_ms), 1),
+                    "deanon_ms": 0.0,
+                })
+
+        log.info("← streaming (deanonymized inline)")
+        return StreamingResponse(_stream_deanonymized(), media_type="text/event-stream")
+
+    # ── Non-streaming path: buffer the full response, deanonymize, return JSON ─
     body["stream"] = False
 
     # ── Anthropic API ─────────────────────────────────────────────────────────
@@ -800,8 +771,6 @@ async def proxy_messages(request: Request) -> Response:
     )
 
     # ── Record timing ─────────────────────────────────────────────────────────
-    vault_snap = get_stats()
-    entities_in_req = sum(vault_snap.values())  # crude proxy for entities seen this session
     _timing.record({
         "ts":        datetime.now(_TZ_BRT).strftime("%H:%M:%S"),
         "model":     model,
@@ -812,9 +781,6 @@ async def proxy_messages(request: Request) -> Response:
         "api_ms":    round(api_ms, 1),
         "deanon_ms": round(deanon_ms, 1),
     })
-
-    if want_stream:
-        return StreamingResponse(_emit_sse(data), media_type="text/event-stream")
 
     return Response(
         content=json.dumps(data),
@@ -848,9 +814,48 @@ async def proxy_chat_completions(request: Request) -> Response:
     anon_ms = (time.perf_counter() - t_anon_start) * 1000
     anon_snap = _timing.snapshot()
 
-    body["stream"] = False
-
     upstream = config.OPENAI_API_URL.rstrip("/")
+
+    # ── Streaming path: forward stream=True and de-anonymize the SSE inline ────
+    if want_stream:
+        body["stream"] = True
+        mappings = get_all_mappings()
+
+        async def _stream_openai_deanonymized():
+            try:
+                async with httpx.AsyncClient(timeout=600) as client:
+                    async with client.stream(
+                        "POST", f"{upstream}/v1/chat/completions", json=body, headers=headers,
+                    ) as resp:
+                        if resp.status_code != 200:
+                            err = (await resp.aread()).decode("utf-8", "replace")[:500]
+                            log.warning(f"← [openai] {resp.status_code} (stream): {err[:200]}")
+                            yield openai_compat.encode_openai_sse(
+                                {"error": {"message": err, "type": "api_error"}}
+                            )
+                            yield openai_compat.encode_openai_sse("[DONE]")
+                            return
+                        events = openai_compat.iter_openai_sse(resp.aiter_bytes())
+                        async for out in openai_compat.deanonymize_openai_stream(events, mappings):
+                            yield openai_compat.encode_openai_sse(out)
+            finally:
+                total_ms = (time.perf_counter() - req_start) * 1000
+                _timing.record({
+                    "ts":        datetime.now(_TZ_BRT).strftime("%H:%M:%S"),
+                    "model":     model,
+                    "total_ms":  round(total_ms, 1),
+                    "anon_ms":   round(anon_ms, 1),
+                    "llm_ms":    anon_snap["llm_ms"],
+                    "regex_ms":  anon_snap["regex_ms"],
+                    "api_ms":    round(max(0.0, total_ms - anon_ms), 1),
+                    "deanon_ms": 0.0,
+                })
+
+        log.info("← [openai] streaming (deanonymized inline)")
+        return StreamingResponse(_stream_openai_deanonymized(), media_type="text/event-stream")
+
+    # ── Non-streaming path: buffer the full response, deanonymize, return JSON ─
+    body["stream"] = False
     t_api_start = time.perf_counter()
     async with httpx.AsyncClient(timeout=600) as client:
         resp = await client.post(
@@ -879,12 +884,6 @@ async def proxy_chat_completions(request: Request) -> Response:
         f"  anon={anon_ms:.0f}ms (llm={anon_snap['llm_ms']:.0f} regex={anon_snap['regex_ms']:.0f})"
         f"  api={api_ms:.0f}ms  deanon={deanon_ms:.0f}ms"
     )
-
-    if want_stream:
-        return StreamingResponse(
-            openai_compat.emit_chat_completion_sse(data),
-            media_type="text/event-stream",
-        )
 
     return Response(
         content=json.dumps(data),
